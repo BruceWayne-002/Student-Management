@@ -1,44 +1,107 @@
-name: Google Sheets → Supabase Sync
+import { createClient } from '@supabase/supabase-js';
+import { google } from 'googleapis';
 
-on:
-  schedule:
-    - cron: "*/10 * * * *"   # every 10 minutes
-  workflow_dispatch:         # allow manual run
+// ---------- ENV ----------
+function getEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing required environment variable: ${name}`);
+  return v;
+}
 
-concurrency:
-  group: sheet-sync
-  cancel-in-progress: true
+const SUPABASE_URL = getEnv('SUPABASE_URL');
+const SUPABASE_SERVICE_ROLE_KEY = getEnv('SUPABASE_SERVICE_ROLE_KEY');
+const GOOGLE_SHEET_ID = getEnv('GOOGLE_SHEET_ID');
 
-jobs:
-  sync:
-    runs-on: ubuntu-latest
+const GOOGLE_SHEET_RANGE = process.env.GOOGLE_SHEET_RANGE || 'Sheet1!A1:Z1000';
+const GOOGLE_SHEET_GID = process.env.GOOGLE_SHEET_GID || '0';
+const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '';
 
-    defaults:
-      run:
-        working-directory: project   # IMPORTANT (your app is inside /project)
+console.log('Environment variables validated.');
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+// ---------- SUPABASE ----------
+const supabase = createClient(
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY,
+  { auth: { persistSession: false } }
+);
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: project/package-lock.json
+// ---------- GOOGLE SHEETS ----------
+async function fetchSheetRows() {
+  if (GOOGLE_SERVICE_ACCOUNT_JSON) {
+    console.log('Using Service Account authentication');
+    const credentials = JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
 
-      - name: Install dependencies
-        run: npm ci
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+    });
 
-      - name: Run Google Sheets → Supabase sync
-        run: npm run sync:sheet
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    const sheets = google.sheets({ version: 'v4', auth });
 
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SHEET_GID: ${{ secrets.GOOGLE_SHEET_GID }}
-          GOOGLE_SHEET_RANGE: ${{ secrets.GOOGLE_SHEET_RANGE }}
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: GOOGLE_SHEET_RANGE,
+    });
 
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+    return res.data.values;
+  }
+
+  console.log('Using public CSV export fallback');
+  const url = `https://docs.google.com/spreadsheets/d/${GOOGLE_SHEET_ID}/export?format=csv&gid=${GOOGLE_SHEET_GID}`;
+  const res = await fetch(url);
+  const csv = await res.text();
+
+  const rows = csv
+    .split('\n')
+    .map(r => r.split(',').map(c => c.trim()));
+
+  return rows;
+}
+
+// ---------- MAIN ----------
+async function sync() {
+  console.log('Starting Google Sheet → Supabase sync...');
+
+  const rows = await fetchSheetRows();
+  if (!rows || rows.length < 2) {
+    console.log('No data found.');
+    return;
+  }
+
+  const headers = rows[0].map(h => h.toLowerCase().replace(/\s+/g, '_'));
+  const dataRows = rows.slice(1);
+
+  const records = dataRows.map(row => {
+    const obj = {};
+    headers.forEach((h, i) => {
+      obj[h] = row[i] ?? null;
+    });
+
+    const present = Number(obj.present_today || 0);
+    const leave = Number(obj.leave_taken || 0);
+    const total = present + leave;
+    obj.attendance_percentage = total > 0 ? (present / total) * 100 : 0;
+
+    return obj;
+  });
+
+  if (!records.length) {
+    console.log('Nothing to upsert.');
+    return;
+  }
+
+  const { error } = await supabase
+    .from('students')
+    .upsert(records, { onConflict: 'register_no' });
+
+  if (error) throw error;
+
+  console.log(`Sync completed. Rows processed: ${records.length}`);
+}
+
+sync()
+  .then(() => process.exit(0))
+  .catch(err => {
+    console.error('Sync failed:', err.message);
+    process.exit(1);
+  });
