@@ -1,0 +1,39 @@
+name: Google Sheets → Supabase Sync
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # Every 10 minutes
+  workflow_dispatch:         # Allow manual runs
+
+concurrency:
+  group: sheet-sync
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Google Sheets → Supabase sync
+        run: npm run sync:sheet
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SHEET_GID: ${{ secrets.GOOGLE_SHEET_GID }}
+          GOOGLE_SHEET_RANGE: ${{ secrets.GOOGLE_SHEET_RANGE }}
+
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
